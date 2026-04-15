@@ -1,0 +1,5 @@
+{
+  "name": "SonicModem",
+  "description": "A high-frequency acoustic data modem that encodes and decodes text over sound waves.",
+  "requestFramePermissions": ["microphone"]
+}
