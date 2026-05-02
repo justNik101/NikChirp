@@ -44,10 +44,10 @@ export default function App() {
   const animationFrameRef = useRef<number | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const headerChunkRef = useRef<Blob | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const isDecodingRef = useRef(false);
+  const listenerNodeRef = useRef<AudioWorkletNode | ScriptProcessorNode | null>(null);
+  const sampleBufRef = useRef<Float32Array>(new Float32Array(0));
+  const decodePendingRef = useRef(false);
+  const decodeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     // Check permission status if API is available
@@ -65,7 +65,8 @@ export default function App() {
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (recordTimerRef.current) clearInterval(recordTimerRef.current);
-      mediaRecorderRef.current?.stop();
+      if (decodeIntervalRef.current) clearInterval(decodeIntervalRef.current);
+      listenerNodeRef.current?.disconnect();
       streamRef.current?.getTracks().forEach(t => t.stop());
       if (audioContextRef.current) audioContextRef.current.close();
     };
@@ -173,8 +174,12 @@ export default function App() {
       setIsListening(false);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (recordTimerRef.current) clearInterval(recordTimerRef.current);
-      mediaRecorderRef.current?.stop();
+      if (decodeIntervalRef.current) clearInterval(decodeIntervalRef.current);
+      listenerNodeRef.current?.disconnect();
+      listenerNodeRef.current = null;
       streamRef.current?.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+      sampleBufRef.current = new Float32Array(0);
       return;
     }
 
@@ -191,57 +196,63 @@ export default function App() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      // Feed mic into analyser for the spectrum visualiser
       const micSource = ctx.createMediaStreamSource(stream);
       micSource.connect(analyserRef.current!);
 
-      // Use MediaRecorder (reliable on all mobile browsers).
-      // We keep the first chunk (container header) + a rolling window of data
-      // chunks.  Every 500 ms a new chunk arrives; we decode the accumulated
-      // buffer each time — decodeAudioToText now searches for the preamble so
-      // bit-boundary alignment happens automatically.
-      headerChunkRef.current = null;
-      chunksRef.current = [];
-      isDecodingRef.current = false;
+      sampleBufRef.current = new Float32Array(0);
+      decodePendingRef.current = false;
 
-      const recorder = new MediaRecorder(stream);
-
-      recorder.ondataavailable = async (e) => {
-        if (e.data.size === 0 || isDecodingRef.current) return;
-
-        if (!headerChunkRef.current) {
-          // First chunk carries the container header (WebM/MP4/Ogg)
-          headerChunkRef.current = e.data;
-          return;
-        }
-
-        chunksRef.current.push(e.data);
-        const MAX_DATA_CHUNKS = 16; // ~8 s rolling window at 500 ms timeslice
-        if (chunksRef.current.length > MAX_DATA_CHUNKS) chunksRef.current.shift();
-
-        isDecodingRef.current = true;
-        try {
-          const blob = new Blob(
-            [headerChunkRef.current, ...chunksRef.current],
-            { type: headerChunkRef.current.type }
-          );
-          const arrayBuffer = await blob.arrayBuffer();
-          const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-          const text = await decodeAudioToText(audioBuffer);
-          if (text) {
-            setDecodedText(text);
-            toast.success(`Message received!`);
-            chunksRef.current = []; // reset data window; keep header
-          }
-        } catch (_) {
-          // Incomplete container data — safe to ignore
-        } finally {
-          isDecodingRef.current = false;
-        }
+      // Accumulate raw PCM into a rolling 8-second buffer
+      const onSamples = (chunk: Float32Array) => {
+        const prev = sampleBufRef.current;
+        const merged = new Float32Array(prev.length + chunk.length);
+        merged.set(prev);
+        merged.set(chunk, prev.length);
+        const maxSamples = ctx.sampleRate * 8;
+        sampleBufRef.current = merged.length > maxSamples
+          ? merged.slice(merged.length - maxSamples)
+          : merged;
       };
 
-      recorder.start(500); // emit a chunk every 500 ms
-      mediaRecorderRef.current = recorder;
+      // Attempt a decode every 500 ms against accumulated PCM
+      decodeIntervalRef.current = setInterval(async () => {
+        if (decodePendingRef.current) return;
+        const samples = sampleBufRef.current;
+        if (samples.length < ctx.sampleRate * 1) return;
+        decodePendingRef.current = true;
+        try {
+          const audioBuf = ctx.createBuffer(1, samples.length, ctx.sampleRate);
+          audioBuf.copyToChannel(samples, 0);
+          const text = await decodeAudioToText(audioBuf);
+          if (text) {
+            setDecodedText(text);
+            toast.success('Message received!');
+            sampleBufRef.current = new Float32Array(0);
+          }
+        } catch (_) {
+          // ignore decode errors
+        } finally {
+          decodePendingRef.current = false;
+        }
+      }, 500);
+
+      // Try AudioWorklet; fall back to ScriptProcessorNode for older browsers
+      try {
+        await ctx.audioWorklet.addModule('/chirp-processor.js');
+        const workletNode = new AudioWorkletNode(ctx, 'chirp-stream-processor');
+        workletNode.port.onmessage = (e: MessageEvent) => {
+          if (e.data instanceof Float32Array) onSamples(e.data);
+        };
+        micSource.connect(workletNode);
+        listenerNodeRef.current = workletNode;
+      } catch (_workletErr) {
+        console.warn('AudioWorklet unavailable, using ScriptProcessorNode fallback');
+        const spn = ctx.createScriptProcessor(4096, 1, 1);
+        spn.onaudioprocess = (e) => onSamples(e.inputBuffer.getChannelData(0).slice());
+        micSource.connect(spn);
+        spn.connect(ctx.destination);
+        listenerNodeRef.current = spn;
+      }
 
       setRecordSeconds(0);
       recordTimerRef.current = setInterval(() => setRecordSeconds(s => s + 1), 1000);
