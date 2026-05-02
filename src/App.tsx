@@ -33,12 +33,16 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [permissionStatus, setPermissionStatus] = useState<'prompt' | 'granted' | 'denied' | 'unknown'>('unknown');
+  const [isDecoding, setIsDecoding] = useState(false);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
 
   useEffect(() => {
     // Check permission status if API is available
@@ -56,6 +60,7 @@ export default function App() {
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (audioContextRef.current) audioContextRef.current.close();
+      streamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []);
 
@@ -156,6 +161,7 @@ export default function App() {
     if (isListening) {
       setIsListening(false);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      mediaRecorderRef.current?.stop();
       return;
     }
 
@@ -170,18 +176,45 @@ export default function App() {
       if (ctx.state === 'suspended') {
         await ctx.resume();
       }
-      
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
       const source = ctx.createMediaStreamSource(stream);
       source.connect(analyserRef.current!);
-      
+
+      recordedChunksRef.current = [];
+      const recorder = new MediaRecorder(stream);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        streamRef.current?.getTracks().forEach(t => t.stop());
+        if (recordedChunksRef.current.length === 0) return;
+        try {
+          setIsDecoding(true);
+          const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
+          const arrayBuffer = await blob.arrayBuffer();
+          const buffer = await ctx.decodeAudioData(arrayBuffer);
+          const text = await decodeAudioToText(buffer);
+          setDecodedText(text || "(no signal detected)");
+          toast.success(text ? "Message decoded!" : "No signal detected.");
+        } catch (error) {
+          console.error(error);
+          toast.error("Failed to decode audio.");
+        } finally {
+          setIsDecoding(false);
+        }
+      };
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+
       setIsListening(true);
       startVisualizer();
-      toast.info("Listening for sonic messages...");
+      toast.info("Recording... Play your sonic message now, then press STOP.");
     } catch (error: any) {
       console.error("Mic Error:", error);
       let message = "Microphone access denied.";
-      
+
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
         message = "Permission denied. Please click the camera/mic icon in your browser's address bar and allow access for this site.";
       } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
@@ -189,7 +222,7 @@ export default function App() {
       } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
         message = "Microphone is already in use by another application.";
       }
-      
+
       toast.error(message, {
         duration: 6000,
       });
@@ -257,8 +290,8 @@ export default function App() {
               SONIC<span className="text-green-500">MODEM</span>
             </h1>
             <p className="text-white/50 mt-2 max-w-md">
-              High-frequency acoustic data transmission protocol. 
-              Encode text into near-ultrasonic waves and decode them back.
+              Acoustic data transmission protocol.
+              Encode text into audible sound waves and decode them back.
             </p>
           </div>
           <div className="flex items-center gap-4 text-xs text-white/30">
@@ -301,7 +334,7 @@ export default function App() {
                   <div className="absolute top-4 right-4 flex flex-col gap-2">
                     <div className="flex items-center gap-2 text-[10px] text-white/40">
                       <div className="w-2 h-2 bg-green-500 rounded-full" />
-                      MODEM BAND (18-20kHz)
+                      MODEM BAND (1.8-2.6kHz)
                     </div>
                   </div>
                   
@@ -478,15 +511,24 @@ export default function App() {
                       <div className="h-px flex-1 bg-white/10" />
                     </div>
 
-                    <Button 
-                      variant="outline" 
-                      className={`w-full h-16 border-white/10 hover:bg-white/5 gap-3 ${isListening ? 'border-red-500/50 bg-red-500/5' : ''}`}
+                    <Button
+                      variant="outline"
+                      className={`w-full h-16 border-white/10 hover:bg-white/5 gap-3 ${isListening ? 'border-red-500/50 bg-red-500/5' : ''} ${isDecoding ? 'opacity-60 cursor-not-allowed' : ''}`}
                       onClick={toggleListen}
+                      disabled={isDecoding}
                     >
-                      {isListening ? (
+                      {isDecoding ? (
+                        <>
+                          <Activity className="w-5 h-5 text-green-500 animate-pulse" />
+                          <span className="text-green-500 font-bold">DECODING...</span>
+                        </>
+                      ) : isListening ? (
                         <>
                           <MicOff className="w-5 h-5 text-red-500" />
-                          <span className="text-red-500 font-bold">STOP LISTENING</span>
+                          <div className="text-left">
+                            <div className="text-sm font-bold text-red-500">STOP & DECODE</div>
+                            <div className="text-[10px] text-red-500/60 uppercase">Click after message plays</div>
+                          </div>
                         </>
                       ) : (
                         <>
@@ -539,10 +581,10 @@ export default function App() {
               </CardHeader>
               <CardContent className="p-4 pt-0 space-y-4">
                 <p className="text-[10px] text-white/40 leading-relaxed">
-                  This modem uses <span className="text-white">Frequency Shift Keying</span>. 
-                  Data is encoded into two distinct frequencies (18.5kHz and 19kHz). 
-                  A 4-bit preamble synchronizes the receiver. 
-                  High frequencies are used to minimize human audibility.
+                  This modem uses <span className="text-white">Frequency Shift Keying</span>.
+                  Data is encoded into two distinct frequencies (1800Hz and 2200Hz).
+                  A 4-bit preamble synchronizes the receiver.
+                  Audible frequencies ensure compatibility across all speakers and microphones.
                 </p>
                 <div className="pt-2 border-t border-white/5">
                   <p className="text-[10px] font-bold text-green-500/70 mb-1 uppercase tracking-tighter">Permission Troubleshooting:</p>
