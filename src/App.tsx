@@ -160,9 +160,10 @@ export default function App() {
     try {
       const arrayBuffer = await file.arrayBuffer();
       const buffer = await ctx.decodeAudioData(arrayBuffer);
-      const text = await decodeAudioToText(buffer);
+      const { text } = await decodeAudioToText(buffer);
       setDecodedText(text);
-      toast.success("File decoded successfully!");
+      if (text) toast.success("File decoded successfully!");
+      else toast.error("No message found in the audio file.");
     } catch (error) {
       console.error(error);
       toast.error("Failed to decode file. Make sure it's a valid sonic message.");
@@ -202,19 +203,22 @@ export default function App() {
       sampleBufRef.current = new Float32Array(0);
       decodePendingRef.current = false;
 
-      // Accumulate raw PCM into a rolling 8-second buffer
+      // Accumulate raw PCM into a rolling 20-second buffer
       const onSamples = (chunk: Float32Array) => {
         const prev = sampleBufRef.current;
         const merged = new Float32Array(prev.length + chunk.length);
         merged.set(prev);
         merged.set(chunk, prev.length);
-        const maxSamples = ctx.sampleRate * 8;
+        const maxSamples = ctx.sampleRate * 20;
         sampleBufRef.current = merged.length > maxSamples
           ? merged.slice(merged.length - maxSamples)
           : merged;
       };
 
-      // Attempt a decode every 500 ms against accumulated PCM
+      // Attempt a decode every 500 ms against accumulated PCM.
+      // Only reset the buffer on a COMPLETE decode (end tone found) — a
+      // partial result means the full message hasn't arrived yet; keep
+      // accumulating so the next attempt includes more bits.
       decodeIntervalRef.current = setInterval(async () => {
         if (decodePendingRef.current) return;
         const samples = sampleBufRef.current;
@@ -223,9 +227,9 @@ export default function App() {
         try {
           const audioBuf = ctx.createBuffer(1, samples.length, ctx.sampleRate);
           audioBuf.copyToChannel(samples, 0);
-          const text = await decodeAudioToText(audioBuf);
-          if (text) {
-            setDecodedText(text);
+          const { text, complete } = await decodeAudioToText(audioBuf);
+          if (text) setDecodedText(text);
+          if (text && complete) {
             toast.success('Message received!');
             sampleBufRef.current = new Float32Array(0);
           }

@@ -70,7 +70,7 @@ function writeTone(data: Float32Array, offset: number, freq: number, duration: n
  * Slides a 25 ms search step to find the preamble at any position in the
  * buffer, then reads data bits from the exact aligned boundary.
  */
-export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
+export async function decodeAudioToText(buffer: AudioBuffer): Promise<{ text: string; complete: boolean }> {
   const data = buffer.getChannelData(0);
   const sampleRate = buffer.sampleRate;
   const stepSize = Math.floor(MODEM_CONFIG.BIT_DURATION * sampleRate);
@@ -97,7 +97,7 @@ export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
     }
   }
 
-  if (preambleStart === -1) return '';
+  if (preambleStart === -1) return { text: '', complete: false };
 
   // --- Aligned data-bit reading ---
   // Analyse the middle 80 % of each bit slot to avoid transition edges.
@@ -105,6 +105,7 @@ export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
   const windowSize = stepSize - windowPad * 2;
   let offset = preambleStart + preambleSamples;
   const bits: number[] = [];
+  let complete = false;
 
   while (offset + stepSize <= data.length) {
     const seg = data.slice(offset + windowPad, offset + windowPad + windowSize);
@@ -115,6 +116,7 @@ export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
     } else if (Math.abs(freq - MODEM_CONFIG.BIT_1_FREQ) < 200) {
       bits.push(1);
     } else if (Math.abs(freq - MODEM_CONFIG.END_FREQ) < 200) {
+      complete = true;
       break;
     }
     offset += stepSize;
@@ -128,7 +130,8 @@ export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
     bytes.push(byte);
   }
 
-  return new TextDecoder().decode(new Uint8Array(bytes));
+  const text = new TextDecoder().decode(new Uint8Array(bytes));
+  return { text, complete };
 }
 
 export function detectDominantFreq(data: Float32Array, sampleRate: number): number {
