@@ -34,6 +34,8 @@ export default function App() {
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [permissionStatus, setPermissionStatus] = useState<'prompt' | 'granted' | 'denied' | 'unknown'>('unknown');
   const [isDecoding, setIsDecoding] = useState(false);
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -59,6 +61,7 @@ export default function App() {
 
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      if (recordTimerRef.current) clearInterval(recordTimerRef.current);
       if (audioContextRef.current) audioContextRef.current.close();
       streamRef.current?.getTracks().forEach(t => t.stop());
     };
@@ -161,6 +164,7 @@ export default function App() {
     if (isListening) {
       setIsListening(false);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      if (recordTimerRef.current) clearInterval(recordTimerRef.current);
       mediaRecorderRef.current?.stop();
       return;
     }
@@ -208,6 +212,8 @@ export default function App() {
       recorder.start();
       mediaRecorderRef.current = recorder;
 
+      setRecordSeconds(0);
+      recordTimerRef.current = setInterval(() => setRecordSeconds(s => s + 1), 1000);
       setIsListening(true);
       startVisualizer();
       toast.info("Recording... Play your sonic message now, then press STOP.");
@@ -331,11 +337,19 @@ export default function App() {
                     height={400} 
                     className="w-full h-full"
                   />
-                  <div className="absolute top-4 right-4 flex flex-col gap-2">
+                  <div className="absolute top-4 right-4 flex flex-col gap-2 items-end">
                     <div className="flex items-center gap-2 text-[10px] text-white/40">
                       <div className="w-2 h-2 bg-green-500 rounded-full" />
                       MODEM BAND (1.8-2.6kHz)
                     </div>
+                    {isListening && (
+                      <div className="flex items-center gap-2 bg-red-500/20 border border-red-500/40 rounded px-2 py-1">
+                        <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                        <span className="text-red-400 font-mono text-[11px] font-bold">
+                          REC {String(Math.floor(recordSeconds / 60)).padStart(2, '0')}:{String(recordSeconds % 60).padStart(2, '0')}
+                        </span>
+                      </div>
+                    )}
                   </div>
                   
                   {!isListening && !isTransmitting && (
@@ -525,9 +539,15 @@ export default function App() {
                       ) : isListening ? (
                         <>
                           <MicOff className="w-5 h-5 text-red-500" />
-                          <div className="text-left">
+                          <div className="text-left flex-1">
                             <div className="text-sm font-bold text-red-500">STOP & DECODE</div>
                             <div className="text-[10px] text-red-500/60 uppercase">Click after message plays</div>
+                          </div>
+                          <div className="flex items-center gap-1.5 ml-auto">
+                            <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                            <span className="text-red-400 font-mono text-xs font-bold">
+                              REC {String(Math.floor(recordSeconds / 60)).padStart(2, '0')}:{String(recordSeconds % 60).padStart(2, '0')}
+                            </span>
                           </div>
                         </>
                       ) : (
