@@ -114,7 +114,7 @@ export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
   return new TextDecoder().decode(new Uint8Array(bytes));
 }
 
-function detectDominantFreq(data: Float32Array, sampleRate: number): number {
+export function detectDominantFreq(data: Float32Array, sampleRate: number): number {
   // Simple FFT-like detection using Goertzel algorithm for specific frequencies
   // or just a simple zero-crossing/peak detection. 
   // For simplicity and reliability at high frequencies, let's use a basic DFT for our target frequencies.

@@ -5,7 +5,8 @@ import {
   MicOff, 
   Download, 
   Upload, 
-  Play, 
+  Play,
+  Square,
   Activity,
   Terminal,
   Volume2,
@@ -20,10 +21,11 @@ import { Toaster } from "@/src/components/ui/sonner";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "motion/react";
 import { 
-  encodeTextToAudio, 
-  decodeAudioToText, 
-  audioBufferToWav, 
-  MODEM_CONFIG 
+  encodeTextToAudio,
+  decodeAudioToText,
+  detectDominantFreq,
+  audioBufferToWav,
+  MODEM_CONFIG
 } from "@/src/lib/audioModem";
 
 export default function App() {
@@ -33,7 +35,7 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [permissionStatus, setPermissionStatus] = useState<'prompt' | 'granted' | 'denied' | 'unknown'>('unknown');
-  const [isDecoding, setIsDecoding] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
   const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -43,8 +45,11 @@ export default function App() {
   const animationFrameRef = useRef<number | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const sampleAccumRef = useRef<Float32Array>(new Float32Array(0));
+  const realtimeStateRef = useRef<'idle' | 'data'>('idle');
+  const preambleHistoryRef = useRef<number[]>([]);
+  const dataBitsRef = useRef<number[]>([]);
 
   useEffect(() => {
     // Check permission status if API is available
@@ -62,8 +67,9 @@ export default function App() {
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (recordTimerRef.current) clearInterval(recordTimerRef.current);
-      if (audioContextRef.current) audioContextRef.current.close();
+      scriptProcessorRef.current?.disconnect();
       streamRef.current?.getTracks().forEach(t => t.stop());
+      if (audioContextRef.current) audioContextRef.current.close();
     };
   }, []);
 
@@ -109,24 +115,28 @@ export default function App() {
     }
 
     if (sourceRef.current) {
-      try {
-        sourceRef.current.stop();
-      } catch (e) {
-        // Ignore if already stopped
-      }
+      try { sourceRef.current.stop(); } catch (e) {}
     }
 
     const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
+    source.loop = true;
     source.connect(analyserRef.current!);
     analyserRef.current!.connect(ctx.destination);
-    
-    source.onended = () => setIsTransmitting(false);
-    
-    setIsTransmitting(true);
+
+    source.onended = () => setIsPlaying(false);
+
+    setIsPlaying(true);
     source.start();
     sourceRef.current = source;
     startVisualizer();
+  };
+
+  const handleStop = () => {
+    if (sourceRef.current) {
+      try { sourceRef.current.stop(); } catch (e) {}
+    }
+    setIsPlaying(false);
   };
 
   const handleDownload = () => {
@@ -165,7 +175,8 @@ export default function App() {
       setIsListening(false);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (recordTimerRef.current) clearInterval(recordTimerRef.current);
-      mediaRecorderRef.current?.stop();
+      scriptProcessorRef.current?.disconnect();
+      streamRef.current?.getTracks().forEach(t => t.stop());
       return;
     }
 
@@ -183,40 +194,88 @@ export default function App() {
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-      const source = ctx.createMediaStreamSource(stream);
-      source.connect(analyserRef.current!);
 
-      recordedChunksRef.current = [];
-      const recorder = new MediaRecorder(stream);
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
-      };
-      recorder.onstop = async () => {
-        streamRef.current?.getTracks().forEach(t => t.stop());
-        if (recordedChunksRef.current.length === 0) return;
-        try {
-          setIsDecoding(true);
-          const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
-          const arrayBuffer = await blob.arrayBuffer();
-          const buffer = await ctx.decodeAudioData(arrayBuffer);
-          const text = await decodeAudioToText(buffer);
-          setDecodedText(text || "(no signal detected)");
-          toast.success(text ? "Message decoded!" : "No signal detected.");
-        } catch (error) {
-          console.error(error);
-          toast.error("Failed to decode audio.");
-        } finally {
-          setIsDecoding(false);
+      const micSource = ctx.createMediaStreamSource(stream);
+      micSource.connect(analyserRef.current!);
+
+      // ScriptProcessorNode accumulates samples and runs the Goertzel detector
+      // on each BIT_DURATION window, feeding a preamble→data state machine.
+      const samplesPerBit = Math.floor(MODEM_CONFIG.BIT_DURATION * ctx.sampleRate);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0;
+      processor.connect(silentGain);
+      silentGain.connect(ctx.destination);
+      micSource.connect(processor);
+
+      sampleAccumRef.current = new Float32Array(0);
+      realtimeStateRef.current = 'idle';
+      preambleHistoryRef.current = [];
+      dataBitsRef.current = [];
+
+      processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        const combined = new Float32Array(sampleAccumRef.current.length + input.length);
+        combined.set(sampleAccumRef.current);
+        combined.set(input, sampleAccumRef.current.length);
+        sampleAccumRef.current = combined;
+
+        while (sampleAccumRef.current.length >= samplesPerBit) {
+          const segment = sampleAccumRef.current.slice(0, samplesPerBit);
+          sampleAccumRef.current = sampleAccumRef.current.slice(samplesPerBit);
+
+          // Skip near-silent segments to avoid false preamble triggers
+          const rms = Math.sqrt(segment.reduce((s, v) => s + v * v, 0) / segment.length);
+          if (rms < 0.005) continue;
+
+          const freq = detectDominantFreq(segment, ctx.sampleRate);
+
+          if (realtimeStateRef.current === 'idle') {
+            preambleHistoryRef.current.push(freq);
+            if (preambleHistoryRef.current.length > MODEM_CONFIG.PREAMBLE.length) {
+              preambleHistoryRef.current.shift();
+            }
+            if (preambleHistoryRef.current.length === MODEM_CONFIG.PREAMBLE.length) {
+              const matched = MODEM_CONFIG.PREAMBLE.every(
+                (expected, i) => Math.abs(preambleHistoryRef.current[i] - expected) < 200
+              );
+              if (matched) {
+                realtimeStateRef.current = 'data';
+                dataBitsRef.current = [];
+                preambleHistoryRef.current = [];
+              }
+            }
+          } else {
+            if (Math.abs(freq - MODEM_CONFIG.BIT_0_FREQ) < 200) {
+              dataBitsRef.current.push(0);
+            } else if (Math.abs(freq - MODEM_CONFIG.BIT_1_FREQ) < 200) {
+              dataBitsRef.current.push(1);
+            } else if (Math.abs(freq - MODEM_CONFIG.END_FREQ) < 200) {
+              const bits = dataBitsRef.current;
+              const bytes: number[] = [];
+              for (let i = 0; i + 8 <= bits.length; i += 8) {
+                let byte = 0;
+                for (let j = 0; j < 8; j++) byte = (byte << 1) | bits[i + j];
+                bytes.push(byte);
+              }
+              const text = new TextDecoder().decode(new Uint8Array(bytes));
+              if (text) {
+                setDecodedText(text);
+                toast.success(`Received: "${text.length > 40 ? text.substring(0, 40) + "…" : text}"`);
+              }
+              realtimeStateRef.current = 'idle';
+              dataBitsRef.current = [];
+            }
+          }
         }
       };
-      recorder.start();
-      mediaRecorderRef.current = recorder;
 
+      scriptProcessorRef.current = processor;
       setRecordSeconds(0);
       recordTimerRef.current = setInterval(() => setRecordSeconds(s => s + 1), 1000);
       setIsListening(true);
       startVisualizer();
-      toast.info("Recording... Play your sonic message now, then press STOP.");
+      toast.info("Listening continuously — messages decode automatically.");
     } catch (error: any) {
       console.error("Mic Error:", error);
       let message = "Microphone access denied.";
@@ -229,9 +288,7 @@ export default function App() {
         message = "Microphone is already in use by another application.";
       }
 
-      toast.error(message, {
-        duration: 6000,
-      });
+      toast.error(message, { duration: 6000 });
     }
   };
 
@@ -422,8 +479,8 @@ export default function App() {
                       <motion.div 
                         className="h-full bg-green-500"
                         initial={{ width: 0 }}
-                        animate={{ width: isTransmitting ? "100%" : "0%" }}
-                        transition={{ duration: audioBuffer?.duration || 0 }}
+                        animate={{ width: (isTransmitting || isPlaying) ? "100%" : "0%" }}
+                        transition={{ duration: isPlaying ? 1 : (audioBuffer?.duration || 0), repeat: isPlaying ? Infinity : 0 }}
                       />
                     </div>
                   </div>
@@ -461,21 +518,31 @@ export default function App() {
                     </div>
 
                     <div className="grid grid-cols-2 gap-4">
-                      <Button 
+                      <Button
                         onClick={handleGenerate}
-                        disabled={isTransmitting || !inputText}
+                        disabled={isTransmitting || isPlaying || !inputText}
                         className="bg-white text-black hover:bg-white/90 font-bold"
                       >
                         {isTransmitting ? "ENCODING..." : "ENCODE"}
                       </Button>
-                      <Button 
-                        variant="outline"
-                        onClick={handlePlay}
-                        disabled={!audioBuffer || isTransmitting}
-                        className="border-white/10 hover:bg-white/5 gap-2"
-                      >
-                        <Play className="w-4 h-4" /> PLAY
-                      </Button>
+                      {isPlaying ? (
+                        <Button
+                          variant="outline"
+                          onClick={handleStop}
+                          className="border-red-500/50 hover:bg-red-500/5 gap-2 text-red-400"
+                        >
+                          <Square className="w-4 h-4" /> STOP
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="outline"
+                          onClick={handlePlay}
+                          disabled={!audioBuffer || isTransmitting}
+                          className="border-white/10 hover:bg-white/5 gap-2"
+                        >
+                          <Play className="w-4 h-4" /> PLAY LOOP
+                        </Button>
+                      )}
                     </div>
 
                     {audioBuffer && (
@@ -527,26 +594,20 @@ export default function App() {
 
                     <Button
                       variant="outline"
-                      className={`w-full h-16 border-white/10 hover:bg-white/5 gap-3 ${isListening ? 'border-red-500/50 bg-red-500/5' : ''} ${isDecoding ? 'opacity-60 cursor-not-allowed' : ''}`}
+                      className={`w-full h-16 border-white/10 hover:bg-white/5 gap-3 ${isListening ? 'border-red-500/50 bg-red-500/5' : ''}`}
                       onClick={toggleListen}
-                      disabled={isDecoding}
                     >
-                      {isDecoding ? (
-                        <>
-                          <Activity className="w-5 h-5 text-green-500 animate-pulse" />
-                          <span className="text-green-500 font-bold">DECODING...</span>
-                        </>
-                      ) : isListening ? (
+                      {isListening ? (
                         <>
                           <MicOff className="w-5 h-5 text-red-500" />
                           <div className="text-left flex-1">
-                            <div className="text-sm font-bold text-red-500">STOP & DECODE</div>
-                            <div className="text-[10px] text-red-500/60 uppercase">Click after message plays</div>
+                            <div className="text-sm font-bold text-red-500">STOP LISTENING</div>
+                            <div className="text-[10px] text-red-500/60 uppercase">Decoding continuously</div>
                           </div>
                           <div className="flex items-center gap-1.5 ml-auto">
                             <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
                             <span className="text-red-400 font-mono text-xs font-bold">
-                              REC {String(Math.floor(recordSeconds / 60)).padStart(2, '0')}:{String(recordSeconds % 60).padStart(2, '0')}
+                              {String(Math.floor(recordSeconds / 60)).padStart(2, '0')}:{String(recordSeconds % 60).padStart(2, '0')}
                             </span>
                           </div>
                         </>
@@ -583,7 +644,7 @@ export default function App() {
                             {decodedText}
                           </motion.div>
                         ) : (
-                          <span className="text-white/10 italic">Waiting for signal...</span>
+                          <span className="text-white/10 italic">{isListening ? "Listening for signal…" : "Waiting for signal..."}</span>
                         )}
                       </div>
                     </div>
