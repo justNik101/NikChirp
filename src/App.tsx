@@ -23,7 +23,6 @@ import { motion, AnimatePresence } from "motion/react";
 import { 
   encodeTextToAudio,
   decodeAudioToText,
-  detectDominantFreq,
   audioBufferToWav,
   MODEM_CONFIG
 } from "@/src/lib/audioModem";
@@ -45,11 +44,10 @@ export default function App() {
   const animationFrameRef = useRef<number | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const sampleAccumRef = useRef<Float32Array>(new Float32Array(0));
-  const realtimeStateRef = useRef<'idle' | 'data'>('idle');
-  const preambleHistoryRef = useRef<number[]>([]);
-  const dataBitsRef = useRef<number[]>([]);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const headerChunkRef = useRef<Blob | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const isDecodingRef = useRef(false);
 
   useEffect(() => {
     // Check permission status if API is available
@@ -67,7 +65,7 @@ export default function App() {
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (recordTimerRef.current) clearInterval(recordTimerRef.current);
-      scriptProcessorRef.current?.disconnect();
+      mediaRecorderRef.current?.stop();
       streamRef.current?.getTracks().forEach(t => t.stop());
       if (audioContextRef.current) audioContextRef.current.close();
     };
@@ -175,7 +173,7 @@ export default function App() {
       setIsListening(false);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (recordTimerRef.current) clearInterval(recordTimerRef.current);
-      scriptProcessorRef.current?.disconnect();
+      mediaRecorderRef.current?.stop();
       streamRef.current?.getTracks().forEach(t => t.stop());
       return;
     }
@@ -188,106 +186,78 @@ export default function App() {
     try {
       initAudio();
       const ctx = audioContextRef.current!;
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
+      if (ctx.state === 'suspended') await ctx.resume();
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
+      // Feed mic into analyser for the spectrum visualiser
       const micSource = ctx.createMediaStreamSource(stream);
       micSource.connect(analyserRef.current!);
 
-      // ScriptProcessorNode accumulates samples and runs the Goertzel detector
-      // on each BIT_DURATION window, feeding a preamble→data state machine.
-      const samplesPerBit = Math.floor(MODEM_CONFIG.BIT_DURATION * ctx.sampleRate);
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
-      const silentGain = ctx.createGain();
-      silentGain.gain.value = 0;
-      processor.connect(silentGain);
-      silentGain.connect(ctx.destination);
-      micSource.connect(processor);
+      // Use MediaRecorder (reliable on all mobile browsers).
+      // We keep the first chunk (container header) + a rolling window of data
+      // chunks.  Every 500 ms a new chunk arrives; we decode the accumulated
+      // buffer each time — decodeAudioToText now searches for the preamble so
+      // bit-boundary alignment happens automatically.
+      headerChunkRef.current = null;
+      chunksRef.current = [];
+      isDecodingRef.current = false;
 
-      sampleAccumRef.current = new Float32Array(0);
-      realtimeStateRef.current = 'idle';
-      preambleHistoryRef.current = [];
-      dataBitsRef.current = [];
+      const recorder = new MediaRecorder(stream);
 
-      processor.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0);
-        const combined = new Float32Array(sampleAccumRef.current.length + input.length);
-        combined.set(sampleAccumRef.current);
-        combined.set(input, sampleAccumRef.current.length);
-        sampleAccumRef.current = combined;
+      recorder.ondataavailable = async (e) => {
+        if (e.data.size === 0 || isDecodingRef.current) return;
 
-        while (sampleAccumRef.current.length >= samplesPerBit) {
-          const segment = sampleAccumRef.current.slice(0, samplesPerBit);
-          sampleAccumRef.current = sampleAccumRef.current.slice(samplesPerBit);
+        if (!headerChunkRef.current) {
+          // First chunk carries the container header (WebM/MP4/Ogg)
+          headerChunkRef.current = e.data;
+          return;
+        }
 
-          // Skip near-silent segments to avoid false preamble triggers
-          const rms = Math.sqrt(segment.reduce((s, v) => s + v * v, 0) / segment.length);
-          if (rms < 0.005) continue;
+        chunksRef.current.push(e.data);
+        const MAX_DATA_CHUNKS = 16; // ~8 s rolling window at 500 ms timeslice
+        if (chunksRef.current.length > MAX_DATA_CHUNKS) chunksRef.current.shift();
 
-          const freq = detectDominantFreq(segment, ctx.sampleRate);
-
-          if (realtimeStateRef.current === 'idle') {
-            preambleHistoryRef.current.push(freq);
-            if (preambleHistoryRef.current.length > MODEM_CONFIG.PREAMBLE.length) {
-              preambleHistoryRef.current.shift();
-            }
-            if (preambleHistoryRef.current.length === MODEM_CONFIG.PREAMBLE.length) {
-              const matched = MODEM_CONFIG.PREAMBLE.every(
-                (expected, i) => Math.abs(preambleHistoryRef.current[i] - expected) < 200
-              );
-              if (matched) {
-                realtimeStateRef.current = 'data';
-                dataBitsRef.current = [];
-                preambleHistoryRef.current = [];
-              }
-            }
-          } else {
-            if (Math.abs(freq - MODEM_CONFIG.BIT_0_FREQ) < 200) {
-              dataBitsRef.current.push(0);
-            } else if (Math.abs(freq - MODEM_CONFIG.BIT_1_FREQ) < 200) {
-              dataBitsRef.current.push(1);
-            } else if (Math.abs(freq - MODEM_CONFIG.END_FREQ) < 200) {
-              const bits = dataBitsRef.current;
-              const bytes: number[] = [];
-              for (let i = 0; i + 8 <= bits.length; i += 8) {
-                let byte = 0;
-                for (let j = 0; j < 8; j++) byte = (byte << 1) | bits[i + j];
-                bytes.push(byte);
-              }
-              const text = new TextDecoder().decode(new Uint8Array(bytes));
-              if (text) {
-                setDecodedText(text);
-                toast.success(`Received: "${text.length > 40 ? text.substring(0, 40) + "…" : text}"`);
-              }
-              realtimeStateRef.current = 'idle';
-              dataBitsRef.current = [];
-            }
+        isDecodingRef.current = true;
+        try {
+          const blob = new Blob(
+            [headerChunkRef.current, ...chunksRef.current],
+            { type: headerChunkRef.current.type }
+          );
+          const arrayBuffer = await blob.arrayBuffer();
+          const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+          const text = await decodeAudioToText(audioBuffer);
+          if (text) {
+            setDecodedText(text);
+            toast.success(`Message received!`);
+            chunksRef.current = []; // reset data window; keep header
           }
+        } catch (_) {
+          // Incomplete container data — safe to ignore
+        } finally {
+          isDecodingRef.current = false;
         }
       };
 
-      scriptProcessorRef.current = processor;
+      recorder.start(500); // emit a chunk every 500 ms
+      mediaRecorderRef.current = recorder;
+
       setRecordSeconds(0);
       recordTimerRef.current = setInterval(() => setRecordSeconds(s => s + 1), 1000);
       setIsListening(true);
       startVisualizer();
-      toast.info("Listening continuously — messages decode automatically.");
+      toast.info("Listening — will decode as soon as a message is detected.");
     } catch (error: any) {
       console.error("Mic Error:", error);
       let message = "Microphone access denied.";
-
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-        message = "Permission denied. Please click the camera/mic icon in your browser's address bar and allow access for this site.";
+        message = "Permission denied. Click the mic icon in the address bar and allow access.";
       } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
         message = "No microphone found on your device.";
       } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
         message = "Microphone is already in use by another application.";
       }
-
       toast.error(message, { duration: 6000 });
     }
   };

@@ -66,28 +66,49 @@ function writeTone(data: Float32Array, offset: number, freq: number, duration: n
 }
 
 /**
- * Decodes an AudioBuffer into text
+ * Decodes an AudioBuffer into text.
+ * Slides a 25 ms search step to find the preamble at any position in the
+ * buffer, then reads data bits from the exact aligned boundary.
  */
 export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
   const data = buffer.getChannelData(0);
   const sampleRate = buffer.sampleRate;
-  const fftSize = 2048;
   const stepSize = Math.floor(MODEM_CONFIG.BIT_DURATION * sampleRate);
-  
+  // Fine search step — 25 ms resolution for preamble sync
+  const searchStep = Math.floor(stepSize / 4);
+  const preambleSamples = MODEM_CONFIG.PREAMBLE.length * stepSize;
+
+  // --- Preamble search ---
+  let preambleStart = -1;
+  for (let i = 0; i + preambleSamples + stepSize <= data.length; i += searchStep) {
+    let matched = 0;
+    for (let p = 0; p < MODEM_CONFIG.PREAMBLE.length; p++) {
+      const s = i + p * stepSize;
+      const seg = data.slice(s, s + stepSize);
+      const rms = Math.sqrt(seg.reduce((acc, v) => acc + v * v, 0) / seg.length);
+      if (rms < 0.002) break;
+      const freq = detectDominantFreq(seg, sampleRate);
+      if (Math.abs(freq - MODEM_CONFIG.PREAMBLE[p]) < 200) matched++;
+      else break;
+    }
+    if (matched === MODEM_CONFIG.PREAMBLE.length) {
+      preambleStart = i;
+      break;
+    }
+  }
+
+  if (preambleStart === -1) return '';
+
+  // --- Aligned data-bit reading ---
+  // Analyse the middle 80 % of each bit slot to avoid transition edges.
+  const windowPad = Math.floor(stepSize * 0.1);
+  const windowSize = stepSize - windowPad * 2;
+  let offset = preambleStart + preambleSamples;
   const bits: number[] = [];
-  let inMessage = false;
-  let bitIndex = 0;
 
-  // This is a simplified decoding. In a real scenario, we'd use a sliding window
-  // to find the preamble and synchronize.
-  
-  // For this implementation, we'll assume the audio starts with the preamble.
-  // We'll skip the preamble (4 bits)
-  let offset = 4 * stepSize;
-
-  while (offset + fftSize < data.length) {
-    const segment = data.slice(offset, offset + fftSize);
-    const freq = detectDominantFreq(segment, sampleRate);
+  while (offset + stepSize <= data.length) {
+    const seg = data.slice(offset + windowPad, offset + windowPad + windowSize);
+    const freq = detectDominantFreq(seg, sampleRate);
 
     if (Math.abs(freq - MODEM_CONFIG.BIT_0_FREQ) < 200) {
       bits.push(0);
@@ -96,18 +117,14 @@ export async function decodeAudioToText(buffer: AudioBuffer): Promise<string> {
     } else if (Math.abs(freq - MODEM_CONFIG.END_FREQ) < 200) {
       break;
     }
-
     offset += stepSize;
   }
 
-  // Convert bits to bytes
+  // Convert bits → bytes → text
   const bytes: number[] = [];
-  for (let i = 0; i < bits.length; i += 8) {
-    if (i + 8 > bits.length) break;
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
     let byte = 0;
-    for (let j = 0; j < 8; j++) {
-      byte = (byte << 1) | bits[i + j];
-    }
+    for (let j = 0; j < 8; j++) byte = (byte << 1) | bits[i + j];
     bytes.push(byte);
   }
 
